@@ -1,0 +1,6 @@
+flask
+telnyx
+openai
+websockets
+python-dotenv
+requests
