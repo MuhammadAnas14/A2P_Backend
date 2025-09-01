@@ -524,24 +524,31 @@ def get_call_count_for_source(source_id):
         return cursor.fetchone()[0]
     except Exception:
         return 0
-
 @app.route("/api/calls/<source_id>", methods=["GET"])
 def get_calls_by_source_id(source_id):
     """
     GET endpoint to fetch call logs filtered by source_id for communication history
     """
     try:
+        if not source_id or source_id == "undefined" or source_id == "null":
+            logging.warning("Invalid source_id received: %s", source_id)
+            return {"calls": [], "message": "No source ID provided"}, 200
+        
+        normalized_source_id = source_id.strip()
+        
         cursor = conn.cursor()
         cursor.execute("""
             SELECT rec_id, phone, created_at, summary_tx, urgency_tx, category_tx, 
                    subcat_tx, summary_gpt, urgency_gpt, category_gpt, subcat_gpt, transcript
             FROM calls 
-            WHERE phone = ?
+            WHERE phone LIKE ? OR phone = ?
             ORDER BY created_at DESC
-        """, (source_id,))
+        """, (f"%{normalized_source_id}%", normalized_source_id))
         
         rows = cursor.fetchall()
         calls = []
+        
+        logging.info("Found %d calls for source_id: %s", len(rows), source_id)
         
         for row in rows:
             call_data = {
@@ -565,7 +572,6 @@ def get_calls_by_source_id(source_id):
     except Exception as e:
         logging.error("Error fetching calls for source_id %s: %s", source_id, e)
         return {"error": str(e)}, 500
-
 
 def get_disposition_from_category(category):
     """Helper function to map category to disposition"""
