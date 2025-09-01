@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from dotenv import load_dotenv
-from flask import Flask, request
+from flask import Flask, request,Response
 from openai import OpenAI
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -144,6 +144,51 @@ app = Flask(__name__)
 from flask_cors import CORS
 CORS(app, origins=["http://localhost:3000", "https://*.vercel.app"])
 state: dict[str, dict] = {}
+
+from flask import Response
+import queue
+import threading
+
+# Global queue for SSE events
+sse_clients = []
+sse_lock = threading.Lock()
+
+def send_sse_event(event_type, data):
+    """Send Server-Sent Event to all connected clients"""
+    with sse_lock:
+        disconnected_clients = []
+        for client_queue in sse_clients:
+            try:
+                client_queue.put(f"event: {event_type}\ndata: {json.dumps(data)}\n\n")
+            except:
+                disconnected_clients.append(client_queue)
+        
+        # Remove disconnected clients
+        for client in disconnected_clients:
+            sse_clients.remove(client)
+
+@app.route("/api/events")
+def events():
+    """Server-Sent Events endpoint for real-time notifications"""
+    def event_stream():
+        client_queue = queue.Queue()
+        with sse_lock:
+            sse_clients.append(client_queue)
+        
+        try:
+            while True:
+                try:
+                    data = client_queue.get(timeout=30)
+                    yield data
+                except queue.Empty:
+                    yield "data: heartbeat\n\n"
+        except GeneratorExit:
+            with sse_lock:
+                if client_queue in sse_clients:
+                    sse_clients.remove(client_queue)
+    
+    return Response(event_stream(), mimetype="text/event-stream")
+
 
 # ─── Helpers ───────────────────────────────────────────────
 
@@ -319,6 +364,12 @@ def hook():
             rec = telnyx_cmd(cid, "record_start", {"format": "wav", "channels": "dual", "transcription": False})
             c["rec_id"] = rec.get("data", {}).get("payload", {}).get("recording_id")
             start_menu(cid)
+            send_sse_event("incoming_call", {
+                "sourceId": phone,
+                "callId": cid,
+                "timestamp": datetime.now().isoformat()
+            })
+            
             
         elif ev == "call.gather.ended":
             digits = pl.get("digits", "") or ""
@@ -344,6 +395,12 @@ def hook():
         elif ev in ("call.hangup", "call.terminated", "call.conversation.ended"):
             c["ended"] = True
             maybe_finish(cid)
+            
+            send_sse_event("call_ended", {
+                "sourceId": phone,
+                "callId": cid,
+                "timestamp": datetime.now().isoformat()
+            })
 
         return "", 204
     except Exception:
@@ -416,6 +473,99 @@ def get_calls():
     except Exception as e:
         logging.error("Error fetching calls: %s", e)
         return {"error": str(e)}, 500
+    
+@app.route("/api/profile/<source_id>", methods=["GET"])
+def get_profile_by_source_id(source_id):
+    """
+    GET endpoint to check if a profile exists for a given source_id (phone number)
+    Returns profile data if exists, 404 if not found
+    """
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT rec_id, phone, created_at, summary_tx, urgency_tx, category_tx, 
+                   subcat_tx, summary_gpt, urgency_gpt, category_gpt, subcat_gpt, transcript
+            FROM calls 
+            WHERE phone = ? 
+            ORDER BY created_at DESC 
+            LIMIT 1
+        """, (source_id,))
+        
+        row = cursor.fetchone()
+        
+        if not row:
+            return {"error": "Profile not found"}, 404
+        
+        # Return profile data for existing source_id
+        profile_data = {
+            "sourceId": row[1],  # phone
+            "companyName": f"Company for {row[1]}",  # You may want to add company mapping
+            "lastContact": row[2] if row[2] else datetime.now().isoformat(),
+            "category": row[9] or row[5] or "General",  # category_gpt or category_tx
+            "subcategory": row[10] or row[6] or "General",  # subcat_gpt or subcat_tx
+            "urgency": row[8] if row[8] else (row[4] if row[4] else 3),  # urgency_gpt or urgency_tx
+            "lastSummary": row[7] or row[3] or "No summary available",  # summary_gpt or summary_tx
+            "totalCalls": get_call_count_for_source(source_id),
+            "engagementScore": 0,  # Set to 0 as requested
+            "exists": True
+        }
+        
+        return profile_data, 200
+        
+    except Exception as e:
+        logging.error("Error fetching profile for source_id %s: %s", source_id, e)
+        return {"error": str(e)}, 500
+
+def get_call_count_for_source(source_id):
+    """Helper function to get total call count for a source_id"""
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM calls WHERE phone = ?", (source_id,))
+        return cursor.fetchone()[0]
+    except Exception:
+        return 0
+
+@app.route("/api/calls/<source_id>", methods=["GET"])
+def get_calls_by_source_id(source_id):
+    """
+    GET endpoint to fetch call logs filtered by source_id for communication history
+    """
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT rec_id, phone, created_at, summary_tx, urgency_tx, category_tx, 
+                   subcat_tx, summary_gpt, urgency_gpt, category_gpt, subcat_gpt, transcript
+            FROM calls 
+            WHERE phone = ?
+            ORDER BY created_at DESC
+        """, (source_id,))
+        
+        rows = cursor.fetchall()
+        calls = []
+        
+        for row in rows:
+            call_data = {
+                "id": row[0],  # rec_id
+                "date": row[2] if row[2] else datetime.now().strftime("%m-%d %H:%M%p"),
+                "type": "In",  # Assuming incoming calls
+                "sourceId": row[1],  # phone
+                "endPoint": "AI Agent",
+                "company": f"Company for {row[1]}",
+                "disposition": get_disposition_from_category(row[5] or row[9]),
+                "urgency": row[8] if row[8] else (row[4] if row[4] else 3),
+                "aiSummary": row[7] or row[3] or "No summary available",
+                "commId": f"COMM-{row[0][:6]}",
+                "transcript": row[11] or "",
+                "subcategory": row[10] or row[6] or "General"
+            }
+            calls.append(call_data)
+        
+        return {"calls": calls}, 200
+        
+    except Exception as e:
+        logging.error("Error fetching calls for source_id %s: %s", source_id, e)
+        return {"error": str(e)}, 500
+
 
 def get_disposition_from_category(category):
     """Helper function to map category to disposition"""
