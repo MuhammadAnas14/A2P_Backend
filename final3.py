@@ -566,6 +566,7 @@ def get_calls_by_source_id(source_id):
                 "subcategory": row[10] or row[6] or "General"
             }
             calls.append(call_data)
+            logging.info("Found  calls for source_id: %s", call_data)
         
         return {"calls": calls}, 200
         
