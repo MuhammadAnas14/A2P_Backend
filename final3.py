@@ -524,6 +524,56 @@ def get_call_count_for_source(source_id):
         return cursor.fetchone()[0]
     except Exception:
         return 0
+# @app.route("/api/calls/<source_id>", methods=["GET"])
+# def get_calls_by_source_id(source_id):
+#     """
+#     GET endpoint to fetch call logs filtered by source_id for communication history
+#     """
+#     try:
+#         if not source_id or source_id == "undefined" or source_id == "null":
+#             logging.warning("Invalid source_id received: %s", source_id)
+#             return {"calls": [], "message": "No source ID provided"}, 200
+        
+#         normalized_source_id = source_id.strip()
+        
+#         cursor = conn.cursor()
+#         cursor.execute("""
+#             SELECT rec_id, phone, created_at, summary_tx, urgency_tx, category_tx, 
+#                    subcat_tx, summary_gpt, urgency_gpt, category_gpt, subcat_gpt, transcript
+#             FROM calls 
+#             WHERE phone LIKE ? OR phone = ?
+#             ORDER BY created_at DESC
+#         """, (f"%{normalized_source_id}%", normalized_source_id))
+        
+#         rows = cursor.fetchall()
+#         calls = []
+        
+#         logging.info("Found %d calls for source_id: %s", len(rows), source_id)
+        
+#         for row in rows:
+#             call_data = {
+#                 "id": row[0],  # rec_id
+#                 "date": row[2] if row[2] else datetime.now().strftime("%m-%d %H:%M%p"),
+#                 "type": "In",  # Assuming incoming calls
+#                 "sourceId": row[1],  # phone
+#                 "endPoint": "AI Agent",
+#                 "company": f"Company for {row[1]}",
+#                 "disposition": get_disposition_from_category(row[5] or row[9]),
+#                 "urgency": row[8] if row[8] else (row[4] if row[4] else 3),
+#                 "aiSummary": row[7] or row[3] or "No summary available",
+#                 "commId": f"COMM-{row[0][:6]}",
+#                 "transcript": row[11] or "",
+#                 "subcategory": row[10] or row[6] or "General"
+#             }
+#             calls.append(call_data)
+#             logging.info("Found  calls for source_id: %s", call_data)
+        
+#         return {"calls": calls}, 200
+        
+#     except Exception as e:
+#         logging.error("Error fetching calls for source_id %s: %s", source_id, e)
+#         return {"error": str(e)}, 500
+
 @app.route("/api/calls/<source_id>", methods=["GET"])
 def get_calls_by_source_id(source_id):
     """
@@ -535,44 +585,63 @@ def get_calls_by_source_id(source_id):
             return {"calls": [], "message": "No source ID provided"}, 200
         
         normalized_source_id = source_id.strip()
+        logging.info("Fetching calls for source_id: %s", normalized_source_id)
         
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT rec_id, phone, created_at, summary_tx, urgency_tx, category_tx, 
-                   subcat_tx, summary_gpt, urgency_gpt, category_gpt, subcat_gpt, transcript
-            FROM calls 
-            WHERE phone LIKE ? OR phone = ?
-            ORDER BY created_at DESC
-        """, (f"%{normalized_source_id}%", normalized_source_id))
+        if DATABASE_URL.startswith("postgres"):
+            import psycopg2
+            db_conn = psycopg2.connect(DATABASE_URL)
+        else:
+            db_path = DATABASE_URL.replace("sqlite:///", "")
+            db_conn = sqlite3.connect(db_path, check_same_thread=False)
         
-        rows = cursor.fetchall()
-        calls = []
+        try:
+            cursor = db_conn.cursor()
+            cursor.execute("""
+                SELECT rec_id, phone, created_at, summary_tx, urgency_tx, category_tx, 
+                       subcat_tx, summary_gpt, urgency_gpt, category_gpt, subcat_gpt, transcript
+                FROM calls 
+                WHERE phone LIKE ? OR phone = ?
+                ORDER BY created_at DESC
+            """, (f"%{normalized_source_id}%", normalized_source_id))
+            
+            rows = cursor.fetchall()
+            logging.info("Found %d calls for source_id: %s", len(rows), normalized_source_id)
+            
+            calls = []
+            
+            for i, row in enumerate(rows):
+                try:
+                    call_data = {
+                        "id": str(row[0]) if row[0] else f"call_{i}",
+                        "date": str(row[2]) if row[2] else datetime.now().strftime("%m-%d %H:%M%p"),
+                        "type": "In",
+                        "sourceId": str(row[1]) if row[1] else normalized_source_id,
+                        "endPoint": "AI Agent",
+                        "company": f"Company for {str(row[1]) if row[1] else 'Unknown'}",
+                        "disposition": get_disposition_from_category(row[5] or row[9]),
+                        "urgency": int(row[8]) if row[8] else (int(row[4]) if row[4] else 3),
+                        "aiSummary": str(row[7] or row[3] or "No summary available"),
+                        "commId": f"COMM-{str(row[0])[:6] if row[0] else f'{i:06d}'}",
+                        "transcript": str(row[11] or ""),
+                        "subcategory": str(row[10] or row[6] or "General")
+                    }
+                    calls.append(call_data)
+                    
+                except Exception as row_error:
+                    logging.error("Error processing row %d: %s", i, row_error)
+                    continue
+            
+            cursor.close()
+            
+        finally:
+            db_conn.close()
         
-        logging.info("Found %d calls for source_id: %s", len(rows), source_id)
-        
-        for row in rows:
-            call_data = {
-                "id": row[0],  # rec_id
-                "date": row[2] if row[2] else datetime.now().strftime("%m-%d %H:%M%p"),
-                "type": "In",  # Assuming incoming calls
-                "sourceId": row[1],  # phone
-                "endPoint": "AI Agent",
-                "company": f"Company for {row[1]}",
-                "disposition": get_disposition_from_category(row[5] or row[9]),
-                "urgency": row[8] if row[8] else (row[4] if row[4] else 3),
-                "aiSummary": row[7] or row[3] or "No summary available",
-                "commId": f"COMM-{row[0][:6]}",
-                "transcript": row[11] or "",
-                "subcategory": row[10] or row[6] or "General"
-            }
-            calls.append(call_data)
-            logging.info("Found  calls for source_id: %s", call_data)
-        
+        logging.info("Successfully processed %d calls for source_id: %s", len(calls), normalized_source_id)
         return {"calls": calls}, 200
         
     except Exception as e:
-        logging.error("Error fetching calls for source_id %s: %s", source_id, e)
-        return {"error": str(e)}, 500
+        logging.error("Error fetching calls for source_id %s: %s", source_id, e, exc_info=True)
+        return {"error": f"Database error: {str(e)}"}, 500
 
 def get_disposition_from_category(category):
     """Helper function to map category to disposition"""
