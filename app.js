@@ -2,6 +2,32 @@
 """
 Telnyx AI Assistant – Post-Call Pipeline (SQLite default) with Google Calendar Integration
 Bug Fixes v8 + Syntax Corrections
+
+Overview
+--------
+This Flask service receives Telnyx call webhooks and orchestrates:
+1) IVR menu (press 1 for AI assistant, 2 for Sales)
+2) AI live assistant start & conversation transcription
+3) Dual-channel call recording and local WAV storage
+4) Post-call pipeline:
+   - Whisper transcription (fallback if Telnyx insights lack a transcript)
+   - GPT-based refinement: summary, urgency (1–5), category, subcategory
+   - SQLite (or Postgres) upsert of call metadata
+   - Optional meeting extraction via GPT and Google Calendar event creation
+
+It also exposes endpoints for:
+- SSE events to notify a React UI about incoming/ended calls
+- Knowledge base sync (upload file to S3-compatible storage and trigger embeddings)
+- Fetching calls & profile summaries for the UI
+- Fetching calls by source ID for communication history
+
+Security Notes
+--------------
+- This assumes env vars are securely provided (no secrets hard-coded).
+- Google token files must be pre-provisioned via OAuth.
+- Telnyx webhooks should be authenticated/validated in production.
+- CORS is limited to local/Vercel frontends; tighten for production.
+
 """
 
 import os, json, logging, traceback, threading, requests, sqlite3, sys, time
@@ -9,7 +35,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from dotenv import load_dotenv
-from flask import Flask, request,Response
+from flask import Flask, request, Response
 from openai import OpenAI
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -17,7 +43,7 @@ import boto3, pathlib, tempfile
 from botocore.config import Config
 
 
-# ─── Environment ───────────────────────────────────────────
+# ─────────────────────────────── Environment ────────────────────────────────
 load_dotenv()
 TELNYX_KEY          = os.getenv("TELNYX_API_KEY")
 TELNYX_ASSISTANT_ID = os.getenv("TELNYX_ASSISTANT_ID")
@@ -26,13 +52,21 @@ DATABASE_URL        = os.getenv("DATABASE_URL", "sqlite:///call_data.db")
 GOOGLE_TOKEN_PATH   = os.getenv("GOOGLE_TOKEN_PATH", "token.json")
 GOOGLE_CRED_PATH    = os.getenv("GOOGLE_CRED_PATH", "credentials.json")
 PORT                = int(os.getenv("PORT", 5000))
+
+# Default Sales transfer number for IVR option 2
 SALES_NUMBER = os.getenv("SALES_NUMBER", "+17059986135")
+
+# Temp directory for KB uploads
 TMP_DIR = Path(tempfile.gettempdir()) / "telnyx_kb"
 TMP_DIR.mkdir(parents=True, exist_ok=True)
+
+# Fail fast if core keys are missing
 assert TELNYX_KEY and TELNYX_ASSISTANT_ID and OPENAI_KEY
 
+# OpenAI client (used for Whisper & GPT classification/extraction)
 client = OpenAI(api_key=OPENAI_KEY)
 
+# S3-compatible KB storage (Telnyx Cloud Storage in this example)
 KB_BUCKET   = os.getenv("TELNYX_BUCKET", "kb-main")
 KB_ENDPOINT = os.getenv("TELNYX_STORAGE_ENDPOINT",
                         "https://us-east-1.telnyxcloudstorage.com")
@@ -51,12 +85,20 @@ s3 = boto3.client(
 )
 
 def kb_upload(local_path: str) -> str:
+    """
+    Upload a file to the KB bucket.
+    Returns the object key if successful.
+    """
     key = pathlib.Path(local_path).name
     s3.upload_file(local_path, KB_BUCKET, key, ExtraArgs={"ACL": "private"})
     logging.info("KB ► uploaded %s to %s/%s", local_path, KB_BUCKET, key)
     return key
 
 def kb_trigger_embed(bucket: str = KB_BUCKET) -> str:
+    """
+    Instruct Telnyx (or your vector service) to rebuild embeddings for the KB.
+    Expects TELNYX_API & HEADERS to be configured.
+    """
     r = requests.post(
         f"{TELNYX_API}/ai/embeddings",
         json={"bucket_name": bucket},
@@ -67,16 +109,26 @@ def kb_trigger_embed(bucket: str = KB_BUCKET) -> str:
     logging.info("KB ► embedding task %s queued", task_id)
     return task_id
 
-# ─── Google Calendar Setup ─────────────────────────────────
+
+# ───────────────────────────── Google Calendar ──────────────────────────────
 def load_calendar_service():
+    """
+    Build an authenticated Google Calendar API client.
+    Assumes token.json exists & has 'calendar.events' scope.
+    """
     creds = Credentials.from_authorized_user_file(
         GOOGLE_TOKEN_PATH,
         ["https://www.googleapis.com/auth/calendar.events"]
     )
     return build('calendar', 'v3', credentials=creds)
 
-# ─── Extract Meeting Time via GPT ────────────────────────────
+
+# ────────────────────────── Extract Meeting Time via GPT ────────────────────
 def extract_meeting_time(transcript: str) -> datetime | None:
+    """
+    Ask GPT to extract a precise meeting datetime (with timezone).
+    Return a Python datetime or None if nothing is found.
+    """
     prompt = f"""
 You are an assistant that extracts meeting date and time from conversations.
 Return ONLY JSON with a single key \"datetime\" whose value is the meeting start
@@ -102,22 +154,28 @@ Conversation transcript:
         logging.error("Time extraction error: %s", e)
     return None
 
-# ─── Constants ─────────────────────────────────────────────
+
+# ───────────────────────────────── Constants ────────────────────────────────
 TELNYX_API = "https://api.telnyx.com/v2"
 HEADERS    = {"Authorization": f"Bearer {TELNYX_KEY}", "Content-Type": "application/json"}
-REC_DIR    = Path("recordings")
+
+# Local directory for saving call recordings
+REC_DIR = Path("recordings")
 REC_DIR.mkdir(exist_ok=True)
 
-# ─── Categories ────────────────────────────────────────────
+# Static taxonomies for GPT categorization
 SALES_SUBCATS   = ["Inquiry","Pricing","Availability","Demo/Book","Order","Price Negotiable","Deposit or Reserve","After Sales Service","Referred"]
 SUPPORT_SUBCATS = ["Troubleshooting","Installation/Setup","Account","Billing","Technical Issue","Complaint","Warranty/Return","How-To","Follow-up"]
 
-# ─── Database setup ────────────────────────────────────────
+
+# ───────────────────────────── Database setup ───────────────────────────────
+# Supports SQLite by default, or Postgres if DATABASE_URL starts with 'postgres'
 if DATABASE_URL.startswith("postgres"):
     try:
         import psycopg2
     except ModuleNotFoundError:
-        logging.error("psycopg2 missing – install or unset DATABASE_URL"); sys.exit(1)
+        logging.error("psycopg2 missing – install or unset DATABASE_URL")
+        sys.exit(1)
     conn = psycopg2.connect(DATABASE_URL)
     autocommit = True
     PLACE = "%s"
@@ -127,34 +185,45 @@ else:
     autocommit = False
     PLACE = "?"
 
+# Simple upsertable call log table for storing raw & GPT-enriched metadata
 conn.execute("""
 CREATE TABLE IF NOT EXISTS calls(
-  rec_id TEXT PRIMARY KEY, phone TEXT, wav_path TEXT,
-  summary_tx TEXT, urgency_tx INTEGER, category_tx TEXT, subcat_tx TEXT,
-  transcript TEXT,
-  summary_gpt TEXT, urgency_gpt INTEGER, category_gpt TEXT, subcat_gpt TEXT,
+  rec_id TEXT PRIMARY KEY,        -- Telnyx recording ID (used as unique key)
+  phone TEXT,                     -- caller number
+  wav_path TEXT,                  -- local path of saved WAV file
+  summary_tx TEXT,                -- Telnyx insights: summary
+  urgency_tx INTEGER,             -- Telnyx insights: urgency (1-5)
+  category_tx TEXT,               -- Telnyx insights: category
+  subcat_tx TEXT,                 -- Telnyx insights: subcategory
+  transcript TEXT,                -- transcript (Telnyx or Whisper fallback)
+  summary_gpt TEXT,               -- GPT refined: summary
+  urgency_gpt INTEGER,            -- GPT refined: urgency (1-5)
+  category_gpt TEXT,              -- GPT refined: category
+  subcat_gpt TEXT,                -- GPT refined: subcategory
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 """)
 if autocommit:
     conn.commit()
 
-# ─── Flask & State ─────────────────────────────────────────
+
+# ───────────────────────────── Flask & SSE State ────────────────────────────
 app = Flask(__name__)
 from flask_cors import CORS
 CORS(app, origins=["http://localhost:3000", "https://*.vercel.app"])
+
+# In-memory call state keyed by call_control_id
 state: dict[str, dict] = {}
 
-from flask import Response
+# Server-Sent Events plumbing to notify the UI of call lifecycle
 import queue
-import threading
-
-# Global queue for SSE events
 sse_clients = []
 sse_lock = threading.Lock()
 
 def send_sse_event(event_type, data):
-    """Send Server-Sent Event to all connected clients"""
+    """
+    Broadcast a Server-Sent Event to connected UI clients.
+    """
     with sse_lock:
         disconnected_clients = []
         for client_queue in sse_clients:
@@ -162,37 +231,40 @@ def send_sse_event(event_type, data):
                 client_queue.put(f"event: {event_type}\ndata: {json.dumps(data)}\n\n")
             except:
                 disconnected_clients.append(client_queue)
-        
-        # Remove disconnected clients
+        # Prune clients that dropped
         for client in disconnected_clients:
             sse_clients.remove(client)
 
 @app.route("/api/events")
 def events():
-    """Server-Sent Events endpoint for real-time notifications"""
+    """
+    SSE endpoint: the React app subscribes to receive 'incoming_call' and 'call_ended'.
+    """
     def event_stream():
         client_queue = queue.Queue()
         with sse_lock:
             sse_clients.append(client_queue)
-        
         try:
             while True:
                 try:
                     data = client_queue.get(timeout=30)
                     yield data
                 except queue.Empty:
+                    # Keep the connection alive
                     yield "data: heartbeat\n\n"
         except GeneratorExit:
             with sse_lock:
                 if client_queue in sse_clients:
                     sse_clients.remove(client_queue)
-    
     return Response(event_stream(), mimetype="text/event-stream")
 
 
-# ─── Helpers ───────────────────────────────────────────────
+# ───────────────────────────────── Helpers ──────────────────────────────────
 
 def telnyx_cmd(cid: str, action: str, body: dict | None = None):
+    """
+    Send a Call Control command to Telnyx for a given call_control_id.
+    """
     r = requests.post(
         f"{TELNYX_API}/calls/{cid}/actions/{action}",
         json=body or {}, headers=HEADERS, timeout=15
@@ -201,7 +273,10 @@ def telnyx_cmd(cid: str, action: str, body: dict | None = None):
     return r.json()
 
 def gather_using_speak(cid: str, prompt: str, valid_digits: str = "12", num_digits: int = 1, timeout_secs: int = 8):
-    # IMPORTANT: valid_digits must be a STRING (e.g., "12")
+    """
+    Simple IVR gather using text-to-speech; captures DTMF digits.
+    `valid_digits` MUST be a string of allowed digits (e.g., "12").
+    """
     return telnyx_cmd(cid, "gather_using_speak", {
         "payload": prompt,
         "valid_digits": valid_digits,
@@ -212,24 +287,31 @@ def gather_using_speak(cid: str, prompt: str, valid_digits: str = "12", num_digi
     })
 
 def speak(cid: str, text: str):
+    """Speak a TTS message into the call."""
     return telnyx_cmd(cid, "speak", {"voice": "AWS.Polly.Brian-Neural", "payload": text})
 
 def transfer_to_sales(cid: str):
+    """Warm/Blind transfer to Sales number."""
     return telnyx_cmd(cid, "transfer", {"to": SALES_NUMBER})
 
 MENU = "Welcome. Press 1 to talk to our A I assistant, or press 2 for Sales."
 
 def start_menu(cid: str):
-    # start the IVR prompt & DTMF gather
+    """Kick off the IVR prompt."""
     return gather_using_speak(cid, MENU, valid_digits="12", num_digits=1, timeout_secs=8)
 
 def handle_menu_selection(cid: str, digits: str):
-    # Option 1: AI assistant
+    """
+    IVR branch:
+      1 → start Telnyx AI Assistant (with transcription)
+      2 → transfer to Sales
+      else → retry once, then fallback to Sales
+    """
     if digits == "1":
         speak(cid, "Connecting you now.")
         return telnyx_cmd(cid, "ai_assistant_start", {
             "assistant": {"id": TELNYX_ASSISTANT_ID},
-            "voice": "AWS.Polly.Brian-Neural",  # you can switch to a Telnyx voice if you prefer
+            "voice": "AWS.Polly.Brian-Neural",
             "greeting": "Hello! I'm your assistant. How can I help you today?",
             "transcription": {
                 "enabled": True,
@@ -237,8 +319,6 @@ def handle_menu_selection(cid: str, digits: str):
                 "enable_interruption_events": True
             }
         })
-
-    # Option 2: Sales transfer
     if digits == "2":
         speak(cid, "Connecting you to Sales.")
         return transfer_to_sales(cid)
@@ -255,11 +335,22 @@ def handle_menu_selection(cid: str, digits: str):
 
 
 def whisper_transcribe(path: Path) -> str:
+    """
+    Fallback transcription using OpenAI Whisper if Telnyx insights don't include a transcript.
+    """
     with path.open("rb") as f:
         return client.audio.transcriptions.create(model="whisper-1", file=f).text
 
 
 def gpt_refine(summary: str, transcript: str) -> dict:
+    """
+    Ask GPT to (re)classify the call and produce:
+    - summary (str)
+    - urgency (int 1..5)
+    - category (str)
+    - subcat (str)
+    Returns a dict with these keys (defaults if parsing fails).
+    """
     prompt = f"""
 You are an AI assistant classifying phone calls.
 Sales sub-cats: {', '.join(SALES_SUBCATS)}
@@ -283,6 +374,10 @@ Transcript: {transcript[:3500]}
 
 
 def save_row(data: dict):
+    """
+    Upsert call metadata into the 'calls' table.
+    Uses rec_id as the primary key.
+    """
     cols = [
         "rec_id","phone","wav_path",
         "summary_tx","urgency_tx","category_tx","subcat_tx",
@@ -301,8 +396,10 @@ def save_row(data: dict):
     conn.commit()
 
 
-
 def create_calendar_event(summary: str, start: datetime, duration_minutes: int = 30):
+    """
+    Create a Google Calendar event starting at `start` for `duration_minutes`.
+    """
     service = load_calendar_service()
     event = {
         'summary': summary,
@@ -315,6 +412,10 @@ def create_calendar_event(summary: str, start: datetime, duration_minutes: int =
 
 
 def maybe_finish(cid: str):
+    """
+    If the call ended and we have a WAV, kick off post-processing
+    in a background thread (delayed by ~60s to allow recording availability).
+    """
     info = state.get(cid, {})
     if info.get("ended") and info.get("wav_path") and not info.get("processing"):
         info["processing"] = True
@@ -322,6 +423,15 @@ def maybe_finish(cid: str):
 
 
 def post_process(cid: str):
+    """
+    Post-call workflow:
+    - Ensure WAV exists
+    - Ensure transcript (Telnyx provided or Whisper fallback)
+    - GPT refine (summary/urgency/category/subcat)
+    - Save to DB
+    - Try to extract a meeting datetime and create a GCal event when present
+    - Cleanup in-memory state
+    """
     info = state.get(cid, {})
     wav = info.get("wav_path")
     if not wav or not Path(wav).exists():
@@ -345,37 +455,53 @@ def post_process(cid: str):
 
     state.pop(cid, None)
 
-# ─── Webhook ───────────────────────────────────────────────
+
+# ───────────────────────────────── Webhook ──────────────────────────────────
 @app.route("/telnyx", methods=["POST"])
 def hook():
+    """
+    Telnyx webhook handler for the call lifecycle.
+
+    Handles (among others):
+    - call.initiated → answer
+    - call.answered → start recording + IVR + notify UI
+    - call.gather.ended → branch IVR choice
+    - call.conversation_insights.generated → capture Telnyx insights
+    - call.recording.saved → download WAV & maybe post-process
+    - call.hangup/call.terminated → mark ended & maybe post-process
+    """
     try:
         data = request.json.get("data", {})
         ev   = data.get("event_type")
         pl   = data.get("payload", {})
         cid  = pl.get("call_control_id")
         phone= pl.get("from")
-        c    = state.setdefault(cid, {"phone": phone})
+
+        c = state.setdefault(cid, {"phone": phone})
         logging.info("▶ %s", ev)
 
         if ev == "call.initiated":
             telnyx_cmd(cid, "answer")
 
         elif ev == "call.answered":
+            # start dual-channel recording (no inline transcription here)
             rec = telnyx_cmd(cid, "record_start", {"format": "wav", "channels": "dual", "transcription": False})
             c["rec_id"] = rec.get("data", {}).get("payload", {}).get("recording_id")
             start_menu(cid)
+            # Notify UI (SSE)
             send_sse_event("incoming_call", {
                 "sourceId": phone,
                 "callId": cid,
                 "timestamp": datetime.now().isoformat()
             })
-            
-            
+
         elif ev == "call.gather.ended":
+            # IVR selection captured; route to AI assistant or Sales
             digits = pl.get("digits", "") or ""
             handle_menu_selection(cid, digits)
 
         elif ev in ("call.conversation_insights.generated", "call.conversation.generated"):
+            # Store Telnyx insights (if present); Whisper will backfill if absent
             ins = pl.get("insights", {})
             c.update({
                 "summary_tx": ins.get("summary", ""),
@@ -386,6 +512,7 @@ def hook():
             })
 
         elif ev == "call.recording.saved":
+            # Download the final recording WAV so we can process it later
             rid = pl.get("recording_id")
             p = REC_DIR / f"{datetime.utcnow():%Y%m%d-%H%M%S}_{rid}.wav"
             p.write_bytes(requests.get(pl.get("recording_urls", {}).get("wav"), timeout=30).content)
@@ -393,9 +520,10 @@ def hook():
             maybe_finish(cid)
 
         elif ev in ("call.hangup", "call.terminated", "call.conversation.ended"):
+            # Mark call ended; if WAV is ready, trigger post processing
             c["ended"] = True
             maybe_finish(cid)
-            
+            # Notify UI (SSE)
             send_sse_event("call_ended", {
                 "sourceId": phone,
                 "callId": cid,
@@ -406,11 +534,19 @@ def hook():
     except Exception:
         traceback.print_exc()
         return "", 500
+
+
+# ───────────────────────────── Knowledge Base Sync ──────────────────────────
 @app.route("/kb_sync", methods=["POST"])
 def kb_sync():
     """
-    POST multipart/form-data  field 'file'
-    OR   POST JSON { "file_url": "https://…" }
+    Upload a file into KB storage and trigger an embeddings rebuild.
+
+    Usage:
+      - multipart/form-data with field 'file'
+      - or JSON: { "file_url": "https://…" }
+
+    Returns 202 on success (embedding job queued).
     """
     try:
         if "file" in request.files:
@@ -428,13 +564,13 @@ def kb_sync():
     except Exception as e:
         logging.error("KB sync failed: %s", e, exc_info=True)
         return {"error": str(e)}, 500
-    
-    
+
+
+# ─────────────────────────────── API – Calls List ───────────────────────────
 @app.route("/api/calls", methods=["GET"])
 def get_calls():
     """
-    GET endpoint to fetch all call logs for the communication log page
-    Returns call data in the format expected by the React frontend
+    Fetch all call logs in a UI-friendly format for the React communications page.
     """
     try:
         cursor = conn.cursor()
@@ -451,20 +587,19 @@ def get_calls():
         for row in rows:
             rec_id = row[0] if isinstance(row[0], str) else (str(row[0]) if row[0] is not None else "")
             comm_id = f"COMM-{rec_id[:6]}" if rec_id else "COMM-XXXXXX"
-            # Format the data to match the React component structure
             call_data = {
-                "id": row[0],  # rec_id
-                "date": row[2] if row[2] else datetime.now().strftime("%m-%d %H:%M%p"),  # created_at
-                "type": "In" if row[1] else "Out",  # Assuming incoming calls for now
-                "sourceId": row[1] or "Unknown",  # phone
+                "id": row[0],
+                "date": row[2] if row[2] else datetime.now().strftime("%m-%d %H:%M%p"),
+                "type": "In",  # NOTE: mark Out if you later add outbound support
+                "sourceId": row[1] or "Unknown",
                 "endPoint": "AI Agent",
-                "company": "Unknown Company",  # You may want to add company mapping
-                "disposition": get_disposition_from_category(row[5] or row[9]),  # category_gpt or category_tx
-                "urgency": row[8] if row[8] else (row[4] if row[4] else 3),  # urgency_gpt or urgency_tx
-                "aiSummary": row[7] or row[3] or "No summary available",  # summary_gpt or summary_tx
+                "company": "Unknown Company",  # TODO: map phone → account if available
+                "disposition": get_disposition_from_category(row[5] or row[9]),
+                "urgency": row[8] if row[8] else (row[4] if row[4] else 3),
+                "aiSummary": row[7] or row[3] or "No summary available",
                 "commId": comm_id,
-                "transcript": row[11] or "",  # transcript
-                "subcategory": row[10] or row[6] or "General"  # subcat_gpt or subcat_tx
+                "transcript": row[11] or "",
+                "subcategory": row[10] or row[6] or "General"
             }
             calls.append(call_data)
         
@@ -473,12 +608,13 @@ def get_calls():
     except Exception as e:
         logging.error("Error fetching calls: %s", e)
         return {"error": str(e)}, 500
-    
+
+
+# ───────────────────────────── API – Profile Lookup ─────────────────────────
 @app.route("/api/profile/<source_id>", methods=["GET"])
 def get_profile_by_source_id(source_id):
     """
-    GET endpoint to check if a profile exists for a given source_id (phone number)
-    Returns profile data if exists, 404 if not found
+    Check if we have any call data for a given phone number and return a simple profile.
     """
     try:
         cursor = conn.cursor()
@@ -492,92 +628,46 @@ def get_profile_by_source_id(source_id):
         """, (source_id,))
         
         row = cursor.fetchone()
-        
         if not row:
             return {"error": "Profile not found"}, 404
         
-        # Return profile data for existing source_id
         profile_data = {
-            "sourceId": row[1],  # phone
-            "companyName": f"Company for {row[1]}",  # You may want to add company mapping
+            "sourceId": row[1],
+            "companyName": f"Company for {row[1]}",  # TODO: real mapping
             "lastContact": row[2] if row[2] else datetime.now().isoformat(),
-            "category": row[9] or row[5] or "General",  # category_gpt or category_tx
-            "subcategory": row[10] or row[6] or "General",  # subcat_gpt or subcat_tx
-            "urgency": row[8] if row[8] else (row[4] if row[4] else 3),  # urgency_gpt or urgency_tx
-            "lastSummary": row[7] or row[3] or "No summary available",  # summary_gpt or summary_tx
+            "category": row[9] or row[5] or "General",
+            "subcategory": row[10] or row[6] or "General",
+            "urgency": row[8] if row[8] else (row[4] if row[4] else 3),
+            "lastSummary": row[7] or row[3] or "No summary available",
             "totalCalls": get_call_count_for_source(source_id),
-            "engagementScore": 0,  # Set to 0 as requested
+            "engagementScore": 0,  # Explicitly 0 for now
             "exists": True
         }
-        
         return profile_data, 200
         
     except Exception as e:
         logging.error("Error fetching profile for source_id %s: %s", source_id, e)
         return {"error": str(e)}, 500
 
+
 def get_call_count_for_source(source_id):
-    """Helper function to get total call count for a source_id"""
+    """
+    Helper: count total calls associated with a given phone number.
+    """
     try:
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM calls WHERE phone = ?", (source_id,))
         return cursor.fetchone()[0]
     except Exception:
         return 0
-# @app.route("/api/calls/<source_id>", methods=["GET"])
-# def get_calls_by_source_id(source_id):
-#     """
-#     GET endpoint to fetch call logs filtered by source_id for communication history
-#     """
-#     try:
-#         if not source_id or source_id == "undefined" or source_id == "null":
-#             logging.warning("Invalid source_id received: %s", source_id)
-#             return {"calls": [], "message": "No source ID provided"}, 200
-        
-#         normalized_source_id = source_id.strip()
-        
-#         cursor = conn.cursor()
-#         cursor.execute("""
-#             SELECT rec_id, phone, created_at, summary_tx, urgency_tx, category_tx, 
-#                    subcat_tx, summary_gpt, urgency_gpt, category_gpt, subcat_gpt, transcript
-#             FROM calls 
-#             WHERE phone LIKE ? OR phone = ?
-#             ORDER BY created_at DESC
-#         """, (f"%{normalized_source_id}%", normalized_source_id))
-        
-#         rows = cursor.fetchall()
-#         calls = []
-        
-#         logging.info("Found %d calls for source_id: %s", len(rows), source_id)
-        
-#         for row in rows:
-#             call_data = {
-#                 "id": row[0],  # rec_id
-#                 "date": row[2] if row[2] else datetime.now().strftime("%m-%d %H:%M%p"),
-#                 "type": "In",  # Assuming incoming calls
-#                 "sourceId": row[1],  # phone
-#                 "endPoint": "AI Agent",
-#                 "company": f"Company for {row[1]}",
-#                 "disposition": get_disposition_from_category(row[5] or row[9]),
-#                 "urgency": row[8] if row[8] else (row[4] if row[4] else 3),
-#                 "aiSummary": row[7] or row[3] or "No summary available",
-#                 "commId": f"COMM-{row[0][:6]}",
-#                 "transcript": row[11] or "",
-#                 "subcategory": row[10] or row[6] or "General"
-#             }
-#             calls.append(call_data)
-#             logging.info("Found  calls for source_id: %s", call_data)
-        
-#         return {"calls": calls}, 200
-        
-#     except Exception as e:
-#         logging.error("Error fetching calls for source_id %s: %s", source_id, e)
-#         return {"error": str(e)}, 500
 
+
+# ─────────────────────── API – Calls by Source (History) ────────────────────
 @app.route("/api/calls/<source_id>", methods=["GET"])
 def get_calls_by_source_id(source_id):
     """
-    GET endpoint to fetch call logs filtered by source_id for communication history
+    Return communication history filtered by phone number (source_id).
+    Designed for the right-hand detail panel in the communications UI.
     """
     try:
         if not source_id or source_id == "undefined" or source_id == "null":
@@ -587,6 +677,7 @@ def get_calls_by_source_id(source_id):
         normalized_source_id = source_id.strip()
         logging.info("Fetching calls for source_id: %s", normalized_source_id)
         
+        # Create a short-lived dedicated connection for this request
         if DATABASE_URL.startswith("postgres"):
             import psycopg2
             db_conn = psycopg2.connect(DATABASE_URL)
@@ -608,7 +699,6 @@ def get_calls_by_source_id(source_id):
             logging.info("Found %d calls for source_id: %s", len(rows), normalized_source_id)
             
             calls = []
-            
             for i, row in enumerate(rows):
                 try:
                     call_data = {
@@ -626,13 +716,12 @@ def get_calls_by_source_id(source_id):
                         "subcategory": str(row[10] or row[6] or "General")
                     }
                     calls.append(call_data)
-                    
                 except Exception as row_error:
+                    # Log and continue if individual row has unexpected data
                     logging.error("Error processing row %d: %s", i, row_error)
                     continue
             
             cursor.close()
-            
         finally:
             db_conn.close()
         
@@ -643,8 +732,11 @@ def get_calls_by_source_id(source_id):
         logging.error("Error fetching calls for source_id %s: %s", source_id, e, exc_info=True)
         return {"error": f"Database error: {str(e)}"}, 500
 
-def get_disposition_from_category(category):
-    """Helper function to map category to disposition"""
+
+def get_disposition_from_category(category: str | None) -> str:
+    """
+    Map high-level category text into a UI 'disposition' label.
+    """
     if not category:
         return "Unknown"
     
@@ -657,9 +749,15 @@ def get_disposition_from_category(category):
         return "Demo Booked"
     else:
         return category
-    
+
+
+# ──────────────────────────────── Entrypoint ────────────────────────────────
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     logging.info("Listening on :%s (DB=%s)", PORT,
                  ("PostgreSQL" if DATABASE_URL.startswith("postgres") else "SQLite"))
+    # In production, consider:
+    #   - debug=False (already set)
+    #   - behind a reverse proxy with HTTPS
+    #   - webhook signature verification
     app.run(host="0.0.0.0", port=PORT, debug=False)
