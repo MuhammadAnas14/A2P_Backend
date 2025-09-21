@@ -13,7 +13,7 @@ from email_analyst import run_email_service
 if __name__ == "__main__":
     # Set default port for email service
     port = int(os.getenv('EMAIL_SERVICE_PORT', 5001))
-    host = os.getenv('EMAIL_SERVICE_HOST', 'localhost')
+    host = os.getenv('EMAIL_SERVICE_HOST', '0.0.0.0')
     debug = os.getenv('EMAIL_SERVICE_DEBUG', 'false').lower() == 'true'
     
     print(f"Starting Email Service on {host}:{port}")
