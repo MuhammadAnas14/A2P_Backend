@@ -282,7 +282,7 @@ CREATE TABLE IF NOT EXISTS emails(
   -- unify on Gmail message id
   rec_id TEXT UNIQUE,           -- e.g., Gmail message id
 
-  -- calls-like placeholders (not used for emails but kept for parity)
+  -- calls-like placeholders (kept for parity)
   phone TEXT,
   wav_path TEXT,
 
@@ -292,7 +292,7 @@ CREATE TABLE IF NOT EXISTS emails(
   category_tx TEXT,
   subcat_tx TEXT,
 
-  -- main text we analyzed (email body + optional thread context)
+  -- main text we analyzed
   transcript TEXT,
 
   -- GPT results
@@ -300,8 +300,9 @@ CREATE TABLE IF NOT EXISTS emails(
   urgency_gpt INTEGER,
   category_gpt TEXT,
   subcat_gpt TEXT,
+  suggested_reply TEXT,         -- <-- NEW: store the model's suggested reply
 
-  -- enrichment (requested)
+  -- enrichment
   company_name TEXT,
   person_name  TEXT,
 
@@ -403,15 +404,16 @@ def db_upsert_contact(conn: sqlite3.Connection, env: EmailEnvelope) -> None:
 
 def db_upsert_analysis(conn: sqlite3.Connection, gmail_id: str, ana: Analysis, model: str) -> None:
     """
-    Keep signature: write GPT outputs onto the same row.
+    Keep signature: write GPT outputs (including suggested_reply) onto the same row.
     """
     conn.execute(
         """
         UPDATE emails
-           SET summary_gpt  = ?,
-               urgency_gpt  = ?,
-               category_gpt = ?,
-               subcat_gpt   = ?
+           SET summary_gpt    = ?,
+               urgency_gpt    = ?,
+               category_gpt   = ?,
+               subcat_gpt     = ?,
+               suggested_reply= ?
          WHERE rec_id = ?
         """,
         (
@@ -419,6 +421,7 @@ def db_upsert_analysis(conn: sqlite3.Connection, gmail_id: str, ana: Analysis, m
             int(ana.urgency),
             ana.category or "",
             ana.subcategory or "",
+            ana.suggested_reply or "",
             gmail_id,
         ),
     )
@@ -1005,7 +1008,7 @@ def get_all_emails():
         cursor.execute("""
             SELECT id, rec_id, phone, wav_path, summary_tx, urgency_tx, 
                    category_tx, subcat_tx, transcript, summary_gpt, urgency_gpt, 
-                   category_gpt, subcat_gpt, company_name, person_name, created_at
+                   category_gpt, subcat_gpt,suggested_reply, company_name, person_name, created_at
             FROM emails 
             ORDER BY created_at DESC
         """)
@@ -1025,11 +1028,11 @@ def get_all_emails():
                 'urgency': row[10] or row[5] or 1,  # Prefer GPT urgency, fallback to TX
                 'category': row[11] or row[6] or '',  # Prefer GPT category, fallback to TX
                 'subcategory': row[12] or row[7] or '',  # Prefer GPT subcategory, fallback to TX
-                'companyName': row[13] or '',
-                'personName': row[14] or '',
-                'timestamp': row[15] or '',
+                'suggested_reply': row[13],
+                'companyName': row[14] or '',
+                'personName': row[15] or '',
+                'timestamp': row[16] or '',
                 'duration': 0,  # Emails don't have duration
-                'status': 'completed'
             }
             emails.append(email_data)
         
