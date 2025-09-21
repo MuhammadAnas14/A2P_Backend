@@ -973,8 +973,8 @@ def main():
 # ────────────────────────────── Flask API ───────────────────────────────
 
 email_app = Flask(__name__)
-CORS(app, origins=["http://localhost:3000", "https://*.vercel.app", "http://51.210.255.18:3000/"])
-CORS(email_app)
+CORS(app, origins=["http://localhost:3000", "https://*.vercel.app", "http://voice.51-210-255-18.sslip.io:3000"])
+# CORS(email_app)
 
 import threading
 thread_local = threading.local()
