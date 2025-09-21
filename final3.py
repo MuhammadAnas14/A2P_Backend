@@ -143,7 +143,7 @@ if autocommit:
 # ─── Flask & State ─────────────────────────────────────────
 app = Flask(__name__)
 from flask_cors import CORS
-CORS(app, origins=["http://localhost:3000", "https://*.vercel.app"])
+CORS(app, origins=["http://localhost:3000", "https://*.vercel.app", "http://51.210.255.18:3000/"])
 state: dict[str, dict] = {}
 
 from flask import Response
