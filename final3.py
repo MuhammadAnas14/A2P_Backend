@@ -129,7 +129,8 @@ else:
 
 conn.execute("""
 CREATE TABLE IF NOT EXISTS calls(
-  rec_id TEXT PRIMARY KEY, phone TEXT, wav_path TEXT,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  rec_id TEXT, phone TEXT, wav_path TEXT,
   summary_tx TEXT, urgency_tx INTEGER, category_tx TEXT, subcat_tx TEXT,
   transcript TEXT,
   summary_gpt TEXT, urgency_gpt INTEGER, category_gpt TEXT, subcat_gpt TEXT,
@@ -283,23 +284,28 @@ Transcript: {transcript[:3500]}
 
 
 def save_row(data: dict):
-    cols = [
-        "rec_id","phone","wav_path",
-        "summary_tx","urgency_tx","category_tx","subcat_tx",
-        "transcript",
-        "summary_gpt","urgency_gpt","category_gpt","subcat_gpt"
-    ]
-    vals = [data.get(k, None) for k in cols]
-    placeholders = ",".join([PLACE] * len(cols))
-    set_clause = ", ".join([f"{c}=excluded.{c}" for c in cols if c != "rec_id"])
-
-    sql = f"""
-    INSERT INTO calls ({", ".join(cols)}) VALUES ({placeholders})
-    ON CONFLICT(rec_id) DO UPDATE SET {set_clause};
-    """
-    conn.execute(sql, vals)
-    conn.commit()
-
+    cols = "rec_id,phone,wav_path,summary_tx,urgency_tx,category_tx,subcat_tx,transcript,summary_gpt,urgency_gpt,category_gpt,subcat_gpt"
+    vals = [str(data.get(k, '')) for k in cols.split(',')]
+    placeholders = ','.join([PLACE] * len(vals))
+    
+    cursor = conn.cursor()
+    cursor.execute(f"INSERT INTO calls({cols}) VALUES({placeholders})", vals)
+    
+    # Get the auto-incremented ID
+    if DATABASE_URL.startswith("postgres"):
+        cursor.execute("SELECT LASTVAL()")
+        new_id = cursor.fetchone()[0]
+    else:
+        new_id = cursor.lastrowid
+    
+    if not autocommit:
+        conn.commit()
+    else:
+        conn.commit()
+    
+    cursor.close()
+    logging.info("Saved call record with ID: %d", new_id)
+    return new_id
 
 
 def create_calendar_event(summary: str, start: datetime, duration_minutes: int = 30):
@@ -439,7 +445,7 @@ def get_calls():
     try:
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT rec_id, phone, created_at, summary_tx, urgency_tx, category_tx, 
+            SELECT id, rec_id, phone, created_at, summary_tx, urgency_tx, category_tx, 
                    subcat_tx, summary_gpt, urgency_gpt, category_gpt, subcat_gpt, transcript
             FROM calls 
             ORDER BY created_at DESC
@@ -449,22 +455,20 @@ def get_calls():
         calls = []
         
         for row in rows:
-            rec_id = row[0] if isinstance(row[0], str) else (str(row[0]) if row[0] is not None else "")
-            comm_id = f"COMM-{rec_id[:6]}" if rec_id else "COMM-XXXXXX"
             # Format the data to match the React component structure
             call_data = {
-                "id": row[0],  # rec_id
-                "date": row[2] if row[2] else datetime.now().strftime("%m-%d %H:%M%p"),  # created_at
-                "type": "In" if row[1] else "Out",  # Assuming incoming calls for now
-                "sourceId": row[1] or "Unknown",  # phone
+                "id": row[1],  # rec_id
+                "date": row[3] if row[3] else datetime.now().strftime("%m-%d %H:%M%p"),  # created_at
+                "type": "In" if row[2] else "Out",  # Assuming incoming calls for now
+                "sourceId": row[2] or "Unknown",  # phone
                 "endPoint": "AI Agent",
                 "company": "Unknown Company",  # You may want to add company mapping
-                "disposition": get_disposition_from_category(row[5] or row[9]),  # category_gpt or category_tx
-                "urgency": row[8] if row[8] else (row[4] if row[4] else 3),  # urgency_gpt or urgency_tx
-                "aiSummary": row[7] or row[3] or "No summary available",  # summary_gpt or summary_tx
-                "commId": comm_id,
-                "transcript": row[11] or "",  # transcript
-                "subcategory": row[10] or row[6] or "General"  # subcat_gpt or subcat_tx
+                "disposition": get_disposition_from_category(row[6] or row[10]),  # category_gpt or category_tx
+                "urgency": row[9] if row[9] else (row[5] if row[5] else 3),  # urgency_gpt or urgency_tx
+                "aiSummary": row[8] or row[4] or "No summary available",  # summary_gpt or summary_tx
+                "commId": f"COMM-{row[0]:06d}",  # id (auto-increment)
+                "transcript": row[12] or "",  # transcript
+                "subcategory": row[11] or row[7] or "General"  # subcat_gpt or subcat_tx
             }
             calls.append(call_data)
         
@@ -483,7 +487,7 @@ def get_profile_by_source_id(source_id):
     try:
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT rec_id, phone, created_at, summary_tx, urgency_tx, category_tx, 
+            SELECT id, rec_id, phone, created_at, summary_tx, urgency_tx, category_tx, 
                    subcat_tx, summary_gpt, urgency_gpt, category_gpt, subcat_gpt, transcript
             FROM calls 
             WHERE phone = ? 
@@ -498,13 +502,13 @@ def get_profile_by_source_id(source_id):
         
         # Return profile data for existing source_id
         profile_data = {
-            "sourceId": row[1],  # phone
-            "companyName": f"Company for {row[1]}",  # You may want to add company mapping
-            "lastContact": row[2] if row[2] else datetime.now().isoformat(),
-            "category": row[9] or row[5] or "General",  # category_gpt or category_tx
-            "subcategory": row[10] or row[6] or "General",  # subcat_gpt or subcat_tx
-            "urgency": row[8] if row[8] else (row[4] if row[4] else 3),  # urgency_gpt or urgency_tx
-            "lastSummary": row[7] or row[3] or "No summary available",  # summary_gpt or summary_tx
+            "sourceId": row[2],  # phone
+            "companyName": f"Company for {row[2]}",  # You may want to add company mapping
+            "lastContact": row[3] if row[3] else datetime.now().isoformat(),
+            "category": row[10] or row[6] or "General",  # category_gpt or category_tx
+            "subcategory": row[11] or row[7] or "General",  # subcat_gpt or subcat_tx
+            "urgency": row[9] if row[9] else (row[5] if row[5] else 3),  # urgency_gpt or urgency_tx
+            "lastSummary": row[8] or row[4] or "No summary available",  # summary_gpt or summary_tx
             "totalCalls": get_call_count_for_source(source_id),
             "engagementScore": 0,  # Set to 0 as requested
             "exists": True
@@ -597,7 +601,7 @@ def get_calls_by_source_id(source_id):
         try:
             cursor = db_conn.cursor()
             cursor.execute("""
-                SELECT rec_id, phone, created_at, summary_tx, urgency_tx, category_tx, 
+                SELECT id, rec_id, phone, created_at, summary_tx, urgency_tx, category_tx, 
                        subcat_tx, summary_gpt, urgency_gpt, category_gpt, subcat_gpt, transcript
                 FROM calls 
                 WHERE phone LIKE ? OR phone = ?
@@ -612,18 +616,18 @@ def get_calls_by_source_id(source_id):
             for i, row in enumerate(rows):
                 try:
                     call_data = {
-                        "id": str(row[0]) if row[0] else f"call_{i}",
-                        "date": str(row[2]) if row[2] else datetime.now().strftime("%m-%d %H:%M%p"),
+                        "id": str(row[1]) if row[1] else f"call_{i}",  # rec_id
+                        "date": str(row[3]) if row[3] else datetime.now().strftime("%m-%d %H:%M%p"),  # created_at
                         "type": "In",
-                        "sourceId": str(row[1]) if row[1] else normalized_source_id,
+                        "sourceId": str(row[2]) if row[2] else normalized_source_id,  # phone
                         "endPoint": "AI Agent",
-                        "company": f"Company for {str(row[1]) if row[1] else 'Unknown'}",
-                        "disposition": get_disposition_from_category(row[5] or row[9]),
-                        "urgency": int(row[8]) if row[8] else (int(row[4]) if row[4] else 3),
-                        "aiSummary": str(row[7] or row[3] or "No summary available"),
-                        "commId": f"COMM-{str(row[0])[:6] if row[0] else f'{i:06d}'}",
-                        "transcript": str(row[11] or ""),
-                        "subcategory": str(row[10] or row[6] or "General")
+                        "company": f"Company for {str(row[2]) if row[2] else 'Unknown'}",
+                        "disposition": get_disposition_from_category(row[6] or row[10]),  # category_tx or category_gpt
+                        "urgency": int(row[9]) if row[9] else (int(row[5]) if row[5] else 3),  # urgency_gpt or urgency_tx
+                        "aiSummary": str(row[8] or row[4] or "No summary available"),  # summary_gpt or summary_tx
+                        "commId": f"COMM-{row[0]:06d}",  # id (auto-increment)
+                        "transcript": str(row[12] or ""),  # transcript
+                        "subcategory": str(row[11] or row[7] or "General")  # subcat_gpt or subcat_tx
                     }
                     calls.append(call_data)
                     

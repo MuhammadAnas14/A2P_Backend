@@ -1,6 +1,13 @@
 flask
-telnyx
 openai
-websockets
 python-dotenv
+google-api-python-client
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+boto3
 requests
+flask-cors
+psycopg2-binary
+html2text
+python-dateutil

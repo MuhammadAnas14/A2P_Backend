@@ -1,0 +1,29 @@
+categories:
+  - name: Sales
+    subcategories: [New Lead, Quote Request, Follow-up, Appointment, Contract]
+  - name: Support
+    subcategories: [Bug/Issue, How-to Question, Feature Request, Outage]
+  - name: Billing
+    subcategories: [Invoice, Payment Issue, Refund, Quote]
+  - name: Hiring/Jobs
+    subcategories: [Application, Resume, Interview Scheduling]
+  - name: Partnerships/Vendors
+    subcategories: [Partnership, Vendor Offer, Sponsorship]
+  - name: Complaint
+    subcategories: [Service, Product, Staff]
+  - name: Spam/Marketing
+    subcategories: [Newsletter, Promo, Cold Outreach]
+  - name: Personal/Internal
+    subcategories: [Internal, FYI]
+reply_guidance:
+  tone: "polite, concise, professional"
+  signoff: "Best regards"
+  org_name: "Your Company"
+  default_language: "English"
+urgency_rubric:
+  0: "Not urgent (FYI, promo, spam)."
+  1: "Low (no action expected)."
+  2: "Routine (respond within 2–3 days)."
+  3: "Timely (respond within 24–48h)."
+  4: "Same-day (time-sensitive)."
+  5: "Immediate (critical)."
