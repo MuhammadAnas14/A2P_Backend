@@ -1018,7 +1018,7 @@ def get_all_emails():
         
         for row in rows:
             email_data = {
-                "commId": f"COMM-{row[0]:06d}",  # id (auto-increment) # Use auto-increment id as commId
+                "commId": f"ECOMM-{row[0]:06d}",  # id (auto-increment) # Use auto-increment id as commId
                 'type': 'email',
                 'direction': 'inbound',
                 'sourceId': row[2],  # phone field contains email address
